@@ -13,8 +13,6 @@ from telegram.ext import (
     CommandHandler,
     CallbackQueryHandler,
     ContextTypes,
-    MessageHandler,
-    filters,
     JobQueue
 )
 import psycopg2
@@ -122,119 +120,113 @@ GENRE_ADJUSTMENTS = {
 class Database:
     def __init__(self):
         self.conn = None
-        self.connect()
         self.create_tables()
     
-    def connect(self):
-        """Establish database connection with retry logic"""
-        max_retries = 5
-        for attempt in range(max_retries):
-            try:
-                self.conn = psycopg2.connect(
-                    Config.DATABASE_URL,
-                    sslmode='require',
-                    cursor_factory=RealDictCursor
-                )
-                logger.info("✅ Connected to PostgreSQL database")
-                return
-            except psycopg2.OperationalError as e:
-                logger.error(f"Database connection failed (attempt {attempt+1}/{max_retries}): {e}")
-                if attempt < max_retries - 1:
-                    sleep_time = 2 ** attempt
-                    logger.info(f"Retrying in {sleep_time} seconds...")
-                    time.sleep(sleep_time)
-                else:
-                    raise
-    
-    def reconnect(self):
-        """Reconnect to the database"""
-        self.close()
-        self.connect()
-    
-    def close(self):
-        """Close database connection"""
-        if self.conn and not self.conn.closed:
-            self.conn.close()
-            logger.info("Database connection closed")
-    
-    def execute_query(self, query, params=None, fetch=False):
-        """Execute a SQL query with error handling and retry"""
+    def get_connection(self):
+        """Get a new database connection"""
         try:
-            with self.conn.cursor() as cursor:
-                cursor.execute(query, params)
-                if fetch:
-                    return cursor.fetchall()
-                self.conn.commit()
-                return True
-        except psycopg2.InterfaceError as e:
-            logger.warning(f"Database connection lost: {e}. Reconnecting...")
-            self.reconnect()
-            return self.execute_query(query, params, fetch)
-        except psycopg2.Error as e:
-            logger.error(f"Database error: {e}")
-            self.conn.rollback()
-            return False
+            return psycopg2.connect(
+                Config.DATABASE_URL,
+                sslmode='require',
+                cursor_factory=RealDictCursor
+            )
+        except psycopg2.OperationalError as e:
+            logger.error(f"Database connection failed: {e}")
+            raise
     
     def create_tables(self):
         """Create required tables if they don't exist"""
-        queries = [
-            """
-            CREATE TABLE IF NOT EXISTS watchlists (
-                user_id TEXT NOT NULL,
-                content_type TEXT NOT NULL,
-                item_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                poster_path TEXT,
-                date_added TIMESTAMP NOT NULL,
-                PRIMARY KEY (user_id, content_type, item_id)
-            );
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS favorites (
-                user_id TEXT NOT NULL,
-                content_type TEXT NOT NULL,
-                item_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                poster_path TEXT,
-                date_added TIMESTAMP NOT NULL,
-                PRIMARY KEY (user_id, content_type, item_id)
-            );
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS notifications (
-                user_id TEXT PRIMARY KEY,
-                enabled BOOLEAN NOT NULL DEFAULT FALSE,
-                frequency TEXT NOT NULL DEFAULT 'weekly',
-                content_type TEXT NOT NULL DEFAULT 'both'
-            );
-            """,
-            "CREATE INDEX IF NOT EXISTS idx_watchlists_user ON watchlists(user_id);",
-            "CREATE INDEX IF NOT EXISTS idx_favorites_user ON favorites(user_id);"
-        ]
-        
-        for query in queries:
-            if not self.execute_query(query):
-                logger.error(f"Failed to execute: {query}")
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Create tables
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS watchlists (
+                    user_id TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    poster_path TEXT,
+                    date_added TIMESTAMP NOT NULL,
+                    PRIMARY KEY (user_id, content_type, item_id)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS favorites (
+                    user_id TEXT NOT NULL,
+                    content_type TEXT NOT NULL,
+                    item_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    poster_path TEXT,
+                    date_added TIMESTAMP NOT NULL,
+                    PRIMARY KEY (user_id, content_type, item_id)
+                )
+            """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS notifications (
+                    user_id TEXT PRIMARY KEY,
+                    enabled BOOLEAN NOT NULL DEFAULT FALSE,
+                    frequency TEXT NOT NULL DEFAULT 'weekly',
+                    content_type TEXT NOT NULL DEFAULT 'both'
+                )
+            """)
+            
+            # Create indexes
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_watchlists_user 
+                ON watchlists(user_id)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_favorites_user 
+                ON favorites(user_id)
+            """)
+            
+            conn.commit()
+            logger.info("✅ Database tables created")
+        except psycopg2.Error as e:
+            logger.error(f"Error creating tables: {e}")
+        finally:
+            if conn:
+                conn.close()
     
-    def get_watchlist(self, user_id, offset=0, limit=None):
+    def execute_query(self, query, params=None, fetch=False):
+        """Execute a SQL query with error handling"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            
+            if fetch:
+                result = cursor.fetchall()
+            else:
+                result = True
+                
+            conn.commit()
+            return result
+        except psycopg2.Error as e:
+            logger.error(f"Database error: {e}")
+            if conn:
+                conn.rollback()
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    def get_watchlist(self, user_id, offset=0, limit=5):
         query = """
         SELECT * FROM watchlists 
         WHERE user_id = %s 
         ORDER BY date_added DESC
+        LIMIT %s OFFSET %s
         """
-        params = [user_id]
-        
-        if limit is not None:
-            query += " LIMIT %s OFFSET %s"
-            params.extend([limit, offset])
-        
-        result = self.execute_query(query, params, fetch=True)
-        return result if result else []
+        return self.execute_query(query, (user_id, limit, offset), fetch=True) or []
     
     def get_watchlist_count(self, user_id):
         query = "SELECT COUNT(*) AS count FROM watchlists WHERE user_id = %s"
-        result = self.execute_query(query, [user_id], fetch=True)
-        return result[0]['count'] if result and result[0] else 0
+        result = self.execute_query(query, (user_id,), fetch=True)
+        return result[0]['count'] if result else 0
     
     def add_to_watchlist(self, user_id, content_type, item_id, title, poster_path):
         query = """
@@ -243,8 +235,10 @@ class Database:
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (user_id, content_type, item_id) DO NOTHING
         """
-        params = (user_id, content_type, item_id, title, poster_path, datetime.now())
-        return self.execute_query(query, params)
+        return self.execute_query(
+            query, 
+            (user_id, content_type, item_id, title, poster_path, datetime.now())
+        )
     
     def remove_from_watchlist(self, user_id, content_type, item_id):
         query = """
@@ -253,25 +247,19 @@ class Database:
         """
         return self.execute_query(query, (user_id, content_type, item_id))
     
-    def get_favorites(self, user_id, offset=0, limit=None):
+    def get_favorites(self, user_id, offset=0, limit=5):
         query = """
         SELECT * FROM favorites 
         WHERE user_id = %s 
         ORDER BY date_added DESC
+        LIMIT %s OFFSET %s
         """
-        params = [user_id]
-        
-        if limit is not None:
-            query += " LIMIT %s OFFSET %s"
-            params.extend([limit, offset])
-        
-        result = self.execute_query(query, params, fetch=True)
-        return result if result else []
+        return self.execute_query(query, (user_id, limit, offset), fetch=True) or []
     
     def get_favorites_count(self, user_id):
         query = "SELECT COUNT(*) AS count FROM favorites WHERE user_id = %s"
-        result = self.execute_query(query, [user_id], fetch=True)
-        return result[0]['count'] if result and result[0] else 0
+        result = self.execute_query(query, (user_id,), fetch=True)
+        return result[0]['count'] if result else 0
     
     def add_to_favorites(self, user_id, content_type, item_id, title, poster_path):
         query = """
@@ -280,8 +268,10 @@ class Database:
         VALUES (%s, %s, %s, %s, %s, %s)
         ON CONFLICT (user_id, content_type, item_id) DO NOTHING
         """
-        params = (user_id, content_type, item_id, title, poster_path, datetime.now())
-        return self.execute_query(query, params)
+        return self.execute_query(
+            query, 
+            (user_id, content_type, item_id, title, poster_path, datetime.now())
+        )
     
     def remove_from_favorites(self, user_id, content_type, item_id):
         query = """
@@ -292,7 +282,7 @@ class Database:
     
     def get_notification_settings(self, user_id):
         query = "SELECT * FROM notifications WHERE user_id = %s"
-        result = self.execute_query(query, [user_id], fetch=True)
+        result = self.execute_query(query, (user_id,), fetch=True)
         return result[0] if result else None
     
     def update_notification_settings(self, user_id, enabled=None, frequency=None, content_type=None):
@@ -318,8 +308,10 @@ class Database:
             frequency = EXCLUDED.frequency,
             content_type = EXCLUDED.content_type
         """
-        params = (user_id, settings['enabled'], settings['frequency'], settings['content_type'])
-        return self.execute_query(query, params)
+        return self.execute_query(
+            query, 
+            (user_id, settings['enabled'], settings['frequency'], settings['content_type'])
+        )
 
 # Initialize database
 db = Database()
@@ -893,13 +885,11 @@ async def _show_list(update: Update, context: ContextTypes.DEFAULT_TYPE, list_ty
         total_count = db.get_watchlist_count(user_id)
         title = "📝 Your Watchlist"
         empty_msg = "Your watchlist is empty. Add items to watch later!"
-        button_text = "View Watchlist"
         items = db.get_watchlist(user_id, offset=(page-1)*items_per_page, limit=items_per_page)
     else:
         total_count = db.get_favorites_count(user_id)
         title = "❤️ Your Favorites"
         empty_msg = "You haven't added any favorites yet. ❤️"
-        button_text = "View Favorites"
         items = db.get_favorites(user_id, offset=(page-1)*items_per_page, limit=items_per_page)
     
     total_pages = max(1, (total_count + items_per_page - 1) // items_per_page)
@@ -957,9 +947,9 @@ async def show_removable_items(update: Update, context: ContextTypes.DEFAULT_TYP
     user_id = str(update.effective_user.id)
     
     if list_type == "watchlist":
-        items = db.get_watchlist(user_id)
+        items = db.get_watchlist(user_id, limit=100)  # Limit to 100 items
     else:
-        items = db.get_favorites(user_id)
+        items = db.get_favorites(user_id, limit=100)
     
     if not items:
         await update.callback_query.edit_message_text(f"Your {list_type} is empty!")
@@ -1134,13 +1124,29 @@ async def set_content_type(update: Update, context: ContextTypes.DEFAULT_TYPE, c
 async def send_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Send scheduled notifications to users."""
     logger.info("Starting notification job...")
-    cursor = context.bot_data['db'].conn.cursor()
-    cursor.execute("SELECT user_id FROM notifications WHERE enabled = TRUE")
-    users = cursor.fetchall()
+    
+    # Get all users with notifications enabled
+    users = []
+    try:
+        # Get a new database connection for this job
+        conn = psycopg2.connect(
+            Config.DATABASE_URL,
+            sslmode='require',
+            cursor_factory=RealDictCursor
+        )
+        cursor = conn.cursor()
+        cursor.execute("SELECT user_id FROM notifications WHERE enabled = TRUE")
+        users = cursor.fetchall()
+    except psycopg2.Error as e:
+        logger.error(f"Database error in notifications: {e}")
+        return
+    finally:
+        if conn:
+            conn.close()
     
     for user_row in users:
         user_id = user_row['user_id']
-        settings = context.bot_data['db'].get_notification_settings(user_id)
+        settings = db.get_notification_settings(user_id)
         if not settings or not settings['enabled']:
             continue
         
@@ -1324,9 +1330,6 @@ def run_bot() -> None:
         application = Application.builder().token(Config.BOT_TOKEN).build()
         logger.info("✅ Application initialized")
         
-        # Store database instance in bot_data
-        application.bot_data['db'] = db
-        
         # Initialize job queue for notifications
         job_queue = application.job_queue
         if job_queue:
@@ -1358,11 +1361,15 @@ def run_bot() -> None:
                 listen="0.0.0.0",
                 port=Config.PORT,
                 secret_token='WEBHOOK_SECRET',
-                webhook_url=Config.WEBHOOK_URL
+                webhook_url=Config.WEBHOOK_URL,
+                drop_pending_updates=True
             )
         else:
             logger.info("🔄 Polling mode activated")
-            application.run_polling(allowed_updates=Update.ALL_TYPES)
+            application.run_polling(
+                drop_pending_updates=True,
+                allowed_updates=Update.ALL_TYPES
+            )
             
         logger.info("🤖 Bot has now stopped")
     except Exception as e:
@@ -1374,7 +1381,7 @@ if __name__ == '__main__':
     # Start Flask app in a separate thread
     flask_thread = threading.Thread(
         target=app.run,
-        kwargs={'host': '0.0.0.0', 'port': Config.PORT}
+        kwargs={'host': '0.0.0.0', 'port': Config.PORT, 'debug': False, 'use_reloader': False}
     )
     flask_thread.daemon = True
     flask_thread.start()
