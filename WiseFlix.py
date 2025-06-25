@@ -3,6 +3,7 @@ import logging
 import random
 import requests
 import time
+import psycopg2
 from datetime import datetime, timedelta
 from functools import lru_cache
 from collections import defaultdict
@@ -15,8 +16,6 @@ from telegram.ext import (
     ContextTypes,
     JobQueue
 )
-import psycopg2
-from psycopg2 import sql
 from psycopg2.extras import RealDictCursor
 from flask import Flask, Response
 
@@ -119,28 +118,33 @@ GENRE_ADJUSTMENTS = {
 # ========== DATABASE HANDLER (POSTGRESQL) ==========
 class Database:
     def __init__(self):
-        self.conn = None
         self.create_tables()
     
     def get_connection(self):
-        """Get a new database connection"""
-        try:
-            return psycopg2.connect(
-                Config.DATABASE_URL,
-                sslmode='require',
-                cursor_factory=RealDictCursor
-            )
-        except psycopg2.OperationalError as e:
-            logger.error(f"Database connection failed: {e}")
-            raise
+        """Get a database connection with retry logic"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                conn = psycopg2.connect(
+                    Config.DATABASE_URL,
+                    sslmode='require',
+                    cursor_factory=RealDictCursor
+                )
+                return conn
+            except psycopg2.OperationalError as e:
+                logger.error(f"Database connection failed (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    raise
     
     def create_tables(self):
         """Create required tables if they don't exist"""
+        conn = None
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
             
-            # Create tables
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS watchlists (
                     user_id TEXT NOT NULL,
@@ -172,7 +176,6 @@ class Database:
                 )
             """)
             
-            # Create indexes
             cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_watchlists_user 
                 ON watchlists(user_id)
@@ -184,7 +187,7 @@ class Database:
             
             conn.commit()
             logger.info("✅ Database tables created")
-        except psycopg2.Error as e:
+        except Exception as e:
             logger.error(f"Error creating tables: {e}")
         finally:
             if conn:
@@ -201,14 +204,12 @@ class Database:
             if fetch:
                 result = cursor.fetchall()
             else:
-                result = True
+                result = cursor.rowcount > 0
                 
             conn.commit()
             return result
-        except psycopg2.Error as e:
+        except Exception as e:
             logger.error(f"Database error: {e}")
-            if conn:
-                conn.rollback()
             return False
         finally:
             if conn:
@@ -226,7 +227,7 @@ class Database:
     def get_watchlist_count(self, user_id):
         query = "SELECT COUNT(*) AS count FROM watchlists WHERE user_id = %s"
         result = self.execute_query(query, (user_id,), fetch=True)
-        return result[0]['count'] if result else 0
+        return result[0]['count'] if result and result[0] else 0
     
     def add_to_watchlist(self, user_id, content_type, item_id, title, poster_path):
         query = """
@@ -259,7 +260,7 @@ class Database:
     def get_favorites_count(self, user_id):
         query = "SELECT COUNT(*) AS count FROM favorites WHERE user_id = %s"
         result = self.execute_query(query, (user_id,), fetch=True)
-        return result[0]['count'] if result else 0
+        return result[0]['count'] if result and result[0] else 0
     
     def add_to_favorites(self, user_id, content_type, item_id, title, poster_path):
         query = """
@@ -312,6 +313,10 @@ class Database:
             query, 
             (user_id, settings['enabled'], settings['frequency'], settings['content_type'])
         )
+    
+    def get_enabled_notification_users(self):
+        query = "SELECT user_id FROM notifications WHERE enabled = TRUE"
+        return self.execute_query(query, fetch=True) or []
 
 # Initialize database
 db = Database()
@@ -479,10 +484,14 @@ def get_tmdb_genres(content_type: str):
     """Cache genre list from TMDb"""
     url = f"{Config.TMDB_BASE_URL}/genre/{content_type}/list"
     params = {'api_key': Config.TMDB_API_KEY}
-    response = requests.get(url, params=params)
-    if response.status_code == 200:
-        return response.json().get('genres', [])
-    return []
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            return response.json().get('genres', [])
+        return []
+    except requests.exceptions.RequestException as e:
+        logger.error(f"TMDb genres API failed: {e}")
+        return []
 
 def get_quality_content(content_type: str, genre_id=None):
     """Get high-quality content with smart filters and improved randomness"""
@@ -531,33 +540,36 @@ def get_quality_content(content_type: str, genre_id=None):
     # Add region parameter for better localization
     base_params['region'] = 'US'
     
-    response = requests.get(url, params={**base_params, **filters})
-    
-    if response.status_code == 200:
-        results = response.json().get('results', [])
-        
-        # Dynamic fallback based on genre rarity
-        min_results = 3 if genre_id in RARE_GENRES else 8
-        if len(results) < min_results:
-            fallback_params = {**filters}
-            fallback_params.update({
-                'vote_count.gte': max(30, filters.get('vote_count.gte', 0) - 20),
-                'vote_average.gte': max(5.0, filters.get('vote_average.gte', 0) - 0.5)
-            })
+    try:
+        response = requests.get(url, params={**base_params, **filters}, timeout=10)
+        if response.status_code == 200:
+            results = response.json().get('results', [])
             
-            response = requests.get(url, params={**base_params, **fallback_params})
-            if response.status_code == 200:
-                return [item for item in response.json().get('results', []) 
-                        if not item.get('adult', False)]
-            else:
-                logger.error(f"TMDb API fallback failed: {response.status_code}")
-                return []
-        
-        # Filter out adult content
-        results = [item for item in results if not item.get('adult', False)]
-        return results
-    else:
-        logger.error(f"TMDb API failed: {response.status_code}")
+            # Dynamic fallback based on genre rarity
+            min_results = 3 if genre_id in RARE_GENRES else 8
+            if len(results) < min_results:
+                fallback_params = {**filters}
+                fallback_params.update({
+                    'vote_count.gte': max(30, filters.get('vote_count.gte', 0) - 20),
+                    'vote_average.gte': max(5.0, filters.get('vote_average.gte', 0) - 0.5)
+                })
+                
+                response = requests.get(url, params={**base_params, **fallback_params}, timeout=10)
+                if response.status_code == 200:
+                    return [item for item in response.json().get('results', []) 
+                            if not item.get('adult', False)]
+                else:
+                    logger.error(f"TMDb API fallback failed: {response.status_code}")
+                    return []
+            
+            # Filter out adult content
+            results = [item for item in results if not item.get('adult', False)]
+            return results
+        else:
+            logger.error(f"TMDb API failed: {response.status_code}")
+            return []
+    except requests.exceptions.RequestException as e:
+        logger.error(f"TMDb API request failed: {e}")
         return []
 
 async def show_genre_selection(query, content_type):
@@ -673,13 +685,13 @@ async def display_random_content(update: Update, context: ContextTypes.DEFAULT_T
     item_id = str(item['id'])
     
     # Check if in watchlist/favorites
-    watchlist_items = db.get_watchlist(user_id)
+    watchlist_items = db.get_watchlist(user_id, limit=100)  # Limited for performance
     in_watchlist = any(
         row['item_id'] == item_id and row['content_type'] == content_type
         for row in watchlist_items
     ) if watchlist_items else False
     
-    favorites_items = db.get_favorites(user_id)
+    favorites_items = db.get_favorites(user_id, limit=100)  # Limited for performance
     in_favorites = any(
         row['item_id'] == item_id and row['content_type'] == content_type
         for row in favorites_items
@@ -745,60 +757,64 @@ async def show_details(update: Update, context: ContextTypes.DEFAULT_TYPE, conte
         'append_to_response': 'videos'
     }
     
-    response = requests.get(url, params=params)
-    if response.status_code == 200:
-        item = response.json()
-        title = item.get('title' if content_type == 'movie' else 'name', 'Unknown')
-        overview = item.get('overview', 'No overview available.')
-        release_date = item.get('release_date' if content_type == 'movie' else 'first_air_date', 'Unknown')
-        vote_average = item.get('vote_average', '?')
-        
-        trailer_url = None
-        videos = item.get('videos', {}).get('results', [])
-        for video in videos:
-            if video.get('type') == 'Trailer' and video.get('site') == 'YouTube':
-                trailer_url = f"https://www.youtube.com/watch?v={video.get('key')}"
-                break
-        
-        message = (
-            f"🎬 <b>{title}</b> ({release_date[:4] if release_date and release_date != 'Unknown' else 'Unknown'})\n"
-            f"⭐ Rating: {vote_average}/10\n\n"
-            f"{overview}\n\n"
-        )
-        
-        if trailer_url:
-            message += f"🎥 <a href='{trailer_url}'>Watch Trailer</a>\n"
-        
-        if source == 'watchlist':
-            back_button = InlineKeyboardButton("⬅️ Back", callback_data=f"my_watchlist:{source_page}")
-        elif source == 'favorites':
-            back_button = InlineKeyboardButton("⬅️ Back", callback_data=f"my_favorites:{source_page}")
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            item = response.json()
+            title = item.get('title' if content_type == 'movie' else 'name', 'Unknown')
+            overview = item.get('overview', 'No overview available.')
+            release_date = item.get('release_date' if content_type == 'movie' else 'first_air_date', 'Unknown')
+            vote_average = item.get('vote_average', '?')
+            
+            trailer_url = None
+            videos = item.get('videos', {}).get('results', [])
+            for video in videos:
+                if video.get('type') == 'Trailer' and video.get('site') == 'YouTube':
+                    trailer_url = f"https://www.youtube.com/watch?v={video.get('key')}"
+                    break
+            
+            message = (
+                f"🎬 <b>{title}</b> ({release_date[:4] if release_date and release_date != 'Unknown' else 'Unknown'})\n"
+                f"⭐ Rating: {vote_average}/10\n\n"
+                f"{overview}\n\n"
+            )
+            
+            if trailer_url:
+                message += f"🎥 <a href='{trailer_url}'>Watch Trailer</a>\n"
+            
+            if source == 'watchlist':
+                back_button = InlineKeyboardButton("⬅️ Back", callback_data=f"my_watchlist:{source_page}")
+            elif source == 'favorites':
+                back_button = InlineKeyboardButton("⬅️ Back", callback_data=f"my_favorites:{source_page}")
+            else:
+                session = context.user_data.get('random_session', {})
+                current_index = session.get('current_index', 0)
+                back_button = InlineKeyboardButton("⬅️ Back", callback_data=f"random_back:{current_index}")
+            
+            keyboard = [
+                [back_button, InlineKeyboardButton("🔀 Next Random", callback_data=f"random:{content_type}")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            query = update.callback_query
+            if query.message.photo:
+                await query.message.reply_text(
+                    message,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=False)
+            else:
+                await query.edit_message_text(
+                    message,
+                    parse_mode='HTML',
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=False)
         else:
-            session = context.user_data.get('random_session', {})
-            current_index = session.get('current_index', 0)
-            back_button = InlineKeyboardButton("⬅️ Back", callback_data=f"random_back:{current_index}")
-        
-        keyboard = [
-            [back_button, InlineKeyboardButton("🔀 Next Random", callback_data=f"random:{content_type}")]
-        ]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        query = update.callback_query
-        if query.message.photo:
-            await query.message.reply_text(
-                message,
-                parse_mode='HTML',
-                reply_markup=reply_markup,
-                disable_web_page_preview=False)
-        else:
-            await query.edit_message_text(
-                message,
-                parse_mode='HTML',
-                reply_markup=reply_markup,
-                disable_web_page_preview=False)
-    else:
-        logger.error(f"Failed to get details for {content_type}/{item_id}: {response.status_code}")
-        await update.callback_query.answer("Failed to get details. Please try again.")
+            logger.error(f"Failed to get details for {content_type}/{item_id}: {response.status_code}")
+            await update.callback_query.answer("Failed to get details. Please try again.")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"TMDb API request failed: {e}")
+        await update.callback_query.answer("API request timed out. Please try again.")
 
 # ========== WATCHLIST/FAVORITES MANAGEMENT ==========
 async def manage_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE, action: str, content_type: str, item_id: str):
@@ -808,24 +824,27 @@ async def manage_watchlist(update: Update, context: ContextTypes.DEFAULT_TYPE, a
     if action == 'add':
         url = f"{Config.TMDB_BASE_URL}/{content_type}/{item_id}"
         params = {'api_key': Config.TMDB_API_KEY}
-        response = requests.get(url, params=params)
-        
-        if response.status_code == 200:
-            item = response.json()
-            success = db.add_to_watchlist(
-                user_id,
-                content_type,
-                item_id,
-                item.get('title' if content_type == 'movie' else 'name'),
-                item.get('poster_path')
-            )
-            if success:
-                await update.callback_query.answer("Added to watchlist!")
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                item = response.json()
+                success = db.add_to_watchlist(
+                    user_id,
+                    content_type,
+                    item_id,
+                    item.get('title' if content_type == 'movie' else 'name'),
+                    item.get('poster_path')
+                )
+                if success:
+                    await update.callback_query.answer("Added to watchlist!")
+                else:
+                    await update.callback_query.answer("Already in watchlist")
             else:
-                await update.callback_query.answer("Already in watchlist")
-        else:
-            logger.error(f"Failed to add to watchlist: {response.status_code}")
-            await update.callback_query.answer("Failed to add to watchlist")
+                logger.error(f"Failed to add to watchlist: {response.status_code}")
+                await update.callback_query.answer("Failed to add to watchlist")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"TMDb API request failed: {e}")
+            await update.callback_query.answer("API request timed out")
     
     elif action == 'remove':
         success = db.remove_from_watchlist(user_id, content_type, item_id)
@@ -845,24 +864,27 @@ async def manage_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE, a
     if action == 'add':
         url = f"{Config.TMDB_BASE_URL}/{content_type}/{item_id}"
         params = {'api_key': Config.TMDB_API_KEY}
-        response = requests.get(url, params=params)
-        
-        if response.status_code == 200:
-            item = response.json()
-            success = db.add_to_favorites(
-                user_id,
-                content_type,
-                item_id,
-                item.get('title' if content_type == 'movie' else 'name'),
-                item.get('poster_path')
-            )
-            if success:
-                await update.callback_query.answer("Added to favorites! ❤️")
+        try:
+            response = requests.get(url, params=params, timeout=10)
+            if response.status_code == 200:
+                item = response.json()
+                success = db.add_to_favorites(
+                    user_id,
+                    content_type,
+                    item_id,
+                    item.get('title' if content_type == 'movie' else 'name'),
+                    item.get('poster_path')
+                )
+                if success:
+                    await update.callback_query.answer("Added to favorites! ❤️")
+                else:
+                    await update.callback_query.answer("Already in favorites")
             else:
-                await update.callback_query.answer("Already in favorites")
-        else:
-            logger.error(f"Failed to add to favorites: {response.status_code}")
-            await update.callback_query.answer("Failed to add to favorites")
+                logger.error(f"Failed to add to favorites: {response.status_code}")
+                await update.callback_query.answer("Failed to add to favorites")
+        except requests.exceptions.RequestException as e:
+            logger.error(f"TMDb API request failed: {e}")
+            await update.callback_query.answer("API request timed out")
     
     elif action == 'remove':
         success = db.remove_from_favorites(user_id, content_type, item_id)
@@ -892,7 +914,7 @@ async def _show_list(update: Update, context: ContextTypes.DEFAULT_TYPE, list_ty
         empty_msg = "You haven't added any favorites yet. ❤️"
         items = db.get_favorites(user_id, offset=(page-1)*items_per_page, limit=items_per_page)
     
-    total_pages = max(1, (total_count + items_per_page - 1) // items_per_page)
+    total_pages = max(1, (total_count + items_per_page - 1) // items_per_page) if total_count > 0 else 1
     page = max(1, min(page, total_pages))
     
     if not items:
@@ -979,11 +1001,11 @@ async def confirm_removal(update: Update, context: ContextTypes.DEFAULT_TYPE, li
     user_id = str(update.effective_user.id)
     
     if list_type == "watchlist":
-        items = db.get_watchlist(user_id)
+        items = db.get_watchlist(user_id, limit=100)
         # Find matching item
         item = next((row for row in items if row['content_type'] == content_type and row['item_id'] == item_id), None)
     else:
-        items = db.get_favorites(user_id)
+        items = db.get_favorites(user_id, limit=100)
         item = next((row for row in items if row['content_type'] == content_type and row['item_id'] == item_id), None)
     
     title = item['title'] if item else 'this item'
@@ -1020,23 +1042,27 @@ async def handle_trending(update: Update, context: ContextTypes.DEFAULT_TYPE, co
         'vote_count.gte': 1000
     }
     
-    response = requests.get(url, params=params)
-    if response.status_code == 200:
-        results = response.json().get('results', [])
-        if results:
-            context.user_data['random_session'] = {
-                'items': results[:20],  # Limit to top 20 trending
-                'content_type': content_type,
-                'source': 'trending',
-                'current_index': 0,
-                'last_refresh': datetime.now().isoformat()
-            }
-            await display_random_content(update, context, 0)
+    try:
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            results = response.json().get('results', [])
+            if results:
+                context.user_data['random_session'] = {
+                    'items': results[:20],  # Limit to top 20 trending
+                    'content_type': content_type,
+                    'source': 'trending',
+                    'current_index': 0,
+                    'last_refresh': datetime.now().isoformat()
+                }
+                await display_random_content(update, context, 0)
+            else:
+                await update.callback_query.answer("No trending items found!")
         else:
-            await update.callback_query.answer("No trending items found!")
-    else:
-        logger.error(f"Failed to get trending {content_type}: {response.status_code}")
-        await update.callback_query.answer("Error fetching trending content")
+            logger.error(f"Failed to get trending {content_type}: {response.status_code}")
+            await update.callback_query.answer("Error fetching trending content")
+    except requests.exceptions.RequestException as e:
+        logger.error(f"TMDb API request failed: {e}")
+        await update.callback_query.answer("API request timed out")
 
 # ========== NOTIFICATION SYSTEM ==========
 async def notification_settings(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1126,23 +1152,12 @@ async def send_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("Starting notification job...")
     
     # Get all users with notifications enabled
-    users = []
-    try:
-        # Get a new database connection for this job
-        conn = psycopg2.connect(
-            Config.DATABASE_URL,
-            sslmode='require',
-            cursor_factory=RealDictCursor
-        )
-        cursor = conn.cursor()
-        cursor.execute("SELECT user_id FROM notifications WHERE enabled = TRUE")
-        users = cursor.fetchall()
-    except psycopg2.Error as e:
-        logger.error(f"Database error in notifications: {e}")
+    users = db.get_enabled_notification_users()
+    if not users:
+        logger.info("No users with enabled notifications")
         return
-    finally:
-        if conn:
-            conn.close()
+    
+    logger.info(f"Sending notifications to {len(users)} users")
     
     for user_row in users:
         user_id = user_row['user_id']
@@ -1181,10 +1196,13 @@ async def send_notifications(context: ContextTypes.DEFAULT_TYPE) -> None:
                         chat_id=user_id,
                         text=caption,
                         parse_mode='HTML')
+                logger.info(f"Sent notification to {user_id}")
             except Exception as e:
                 logger.error(f"Error sending notification to {user_id}: {e}")
+        else:
+            logger.warning(f"No recommendations found for {user_id}")
     
-    logger.info(f"Sent notifications to {len(users)} users")
+    logger.info(f"Completed notification job")
 
 # ========== COMMAND HANDLERS ==========
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
